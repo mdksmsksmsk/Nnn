@@ -18,7 +18,8 @@ from aiogram.types import (
 # AYARLAR
 # ==============================
 
-TOKEN = os.getenv("9181601804:AAHfoIJ21Ir-GCUWC_IQMYA3xWWwAMdbrME", "")
+TOKEN = os.getenv("BOT_TOKEN", "").strip()
+
 ADMIN_IDS = {
     int(x.strip())
     for x in os.getenv("ADMIN_IDS", "").split(",")
@@ -32,7 +33,7 @@ CHANNELS = [
 ]
 
 FILE_CHANNEL = "@hilemfk"
-DB_NAME = "swarovski.db"
+DB_NAME = os.getenv("DB_PATH", "swarovski.db")
 
 router = Router()
 
@@ -42,7 +43,7 @@ router = Router()
 # ==============================
 
 def db():
-    return sqlite3.connect(DB_NAME)
+    return sqlite3.connect(DB_NAME, timeout=30)
 
 
 def init_db():
@@ -56,12 +57,14 @@ def init_db():
                 referral_counted INTEGER DEFAULT 0
             )
         """)
+
         con.execute("""
             CREATE TABLE IF NOT EXISTS stats (
                 name TEXT PRIMARY KEY,
                 value INTEGER DEFAULT 0
             )
         """)
+
         con.execute("""
             INSERT OR IGNORE INTO stats(name, value)
             VALUES('commands', 0)
@@ -69,6 +72,9 @@ def init_db():
 
 
 def register_user(user_id, username, referrer=None):
+    if referrer == user_id:
+        referrer = None
+
     with db() as con:
         con.execute("""
             INSERT OR IGNORE INTO users
@@ -76,18 +82,12 @@ def register_user(user_id, username, referrer=None):
             VALUES (?, ?, ?)
         """, (user_id, username, referrer))
 
-        if referrer and referrer != user_id:
-            con.execute("""
-                UPDATE users
-                SET referrer_id = ?
-                WHERE user_id = ? AND referrer_id IS NULL
-            """, (referrer, user_id))
-
 
 def add_command():
     with db() as con:
         con.execute("""
-            UPDATE stats SET value = value + 1
+            UPDATE stats
+            SET value = value + 1
             WHERE name = 'commands'
         """)
 
@@ -98,6 +98,7 @@ def get_referrals(user_id):
             "SELECT referrals FROM users WHERE user_id = ?",
             (user_id,)
         ).fetchone()
+
     return row[0] if row else 0
 
 
@@ -105,26 +106,39 @@ def credit_referral(user_id):
     with db() as con:
         row = con.execute("""
             SELECT referrer_id, referral_counted
-            FROM users WHERE user_id = ?
+            FROM users
+            WHERE user_id = ?
         """, (user_id,)).fetchone()
 
         if not row:
-            return
+            return False
 
         referrer_id, counted = row
 
         if not referrer_id or counted:
-            return
+            return False
 
-        con.execute("""
-            UPDATE users SET referral_counted = 1
+        if referrer_id == user_id:
+            return False
+
+        cursor = con.execute("""
+            UPDATE users
+            SET referral_counted = 1
             WHERE user_id = ?
+            AND referral_counted = 0
+            AND referrer_id IS NOT NULL
         """, (user_id,))
 
+        if cursor.rowcount != 1:
+            return False
+
         con.execute("""
-            UPDATE users SET referrals = referrals + 1
+            UPDATE users
+            SET referrals = referrals + 1
             WHERE user_id = ?
         """, (referrer_id,))
+
+        return True
 
 
 # ==============================
@@ -142,14 +156,12 @@ async def check_subscriptions(bot, user_id):
             if member.status in ("left", "kicked"):
                 return False
 
-            if member.status == "restricted":
-                if not member.is_member:
-                    return False
+            if member.status == "restricted" and not member.is_member:
+                return False
 
-        except Exception as error:
-            logging.warning(
-                "Üyelik kontrolü başarısız (%s): %s",
-                channel, error
+        except Exception:
+            logging.exception(
+                "Üyelik kontrolü başarısız: %s", channel
             )
             return False
 
@@ -288,7 +300,7 @@ async def show_referral_gate(message, bot, user_id):
     await message.answer(
         "👥 **DAVET ŞARTI**\n\n"
         "Kanallarımıza katıldın! Şimdi botun diğer özelliklerini "
-        "açmak için 1 gerçek arkadaşını davet etmelisin.\n\n"
+        "açmak için 1 arkadaşını davet etmelisin.\n\n"
         f"Başarılı davetlerin: {get_referrals(user_id)}/1\n\n"
         "Arkadaşın davet bağlantından gelip üç kanalımıza katılmalı.",
         reply_markup=referral_gate_keyboard(link),
@@ -323,9 +335,7 @@ async def require_access(callback, bot):
             "❌ Önce 1 arkadaşını davet etmelisin.",
             show_alert=True
         )
-        await show_referral_gate(
-            callback.message, bot, user_id
-        )
+        await show_referral_gate(callback.message, bot, user_id)
         return False
 
     return True
@@ -338,15 +348,18 @@ async def require_access(callback, bot):
 @router.message(Command("start", "menu"))
 async def start(message: Message, bot: Bot):
     user = message.from_user
-    args = message.text.split()
 
+    if not user:
+        return
+
+    args = (message.text or "").split()
     referrer = None
 
     if len(args) > 1 and args[1].startswith("ref_"):
         try:
             referrer = int(args[1][4:])
         except ValueError:
-            pass
+            referrer = None
 
     register_user(user.id, user.username, referrer)
     add_command()
@@ -385,13 +398,10 @@ async def check_sub_button(callback: CallbackQuery, bot: Bot):
         return
 
     credit_referral(user_id)
-
     await callback.answer("✅ Kanal üyeliğin onaylandı!")
 
     if get_referrals(user_id) < 1:
-        await show_referral_gate(
-            callback.message, bot, user_id
-        )
+        await show_referral_gate(callback.message, bot, user_id)
     else:
         await callback.message.answer(
             "🎉 **Tüm şartlar tamamlandı!**",
@@ -483,7 +493,6 @@ async def send_file(callback: CallbackQuery, bot: Bot):
         return
 
     message_id = FILES[callback.data]
-
     await callback.answer("📦 Dosya hazırlanıyor...")
 
     try:
@@ -520,8 +529,8 @@ async def legit_menu(callback: CallbackQuery, bot: Bot):
         "5️⃣ **Harita:** Köşeleri ve geçiş noktalarını ezberle.\n\n"
         "6️⃣ **Takım:** Takım arkadaşlarınla aynı anda hareket et.\n\n"
         "7️⃣ **Ekonomi:** Oyun içi paranı takımın durumuna göre kullan.\n\n"
-        "8️⃣ **Güvenlik:** Bilinmeyen APK ve hile dosyalarına "
-        "hesap bilgilerini verme.\n\n"
+        "8️⃣ **Güvenlik:** Bilinmeyen APK ve dosyalara hesap "
+        "bilgilerini verme.\n\n"
         "🏆 En iyi gelişim düzenli ve adil antrenmandır."
     )
 
@@ -629,17 +638,22 @@ async def fun_secret(callback: CallbackQuery, bot: Bot):
 
 @router.callback_query(F.data == "back_to_menu")
 async def back_to_menu(callback: CallbackQuery, bot: Bot):
-    if not await has_access(bot, callback.from_user.id):
-        if not await check_subscriptions(bot, callback.from_user.id):
-            await callback.answer("Kanal üyeliğin eksik.", show_alert=True)
+    user_id = callback.from_user.id
+
+    if not await has_access(bot, user_id):
+        await callback.answer(
+            "Erişim şartların eksik.",
+            show_alert=True
+        )
+
+        if not await check_subscriptions(bot, user_id):
             await callback.message.answer(
                 "⚠️ Kanallara tekrar katılmalısın.",
                 reply_markup=subscribe_keyboard()
             )
         else:
-            await callback.answer("Bir arkadaşını davet etmelisin.", show_alert=True)
             await show_referral_gate(
-                callback.message, bot, callback.from_user.id
+                callback.message, bot, user_id
             )
         return
 
@@ -695,21 +709,39 @@ async def admin_panel(callback: CallbackQuery):
 # ==============================
 
 @router.chat_member()
-async def membership_changed(event: ChatMemberUpdated, bot: Bot):
-    old_status = event.old_chat_member.status
+async def membership_changed(
+    event: ChatMemberUpdated,
+    bot: Bot
+):
+    channel_username = event.chat.username
+
+    if not channel_username:
+        return
+
+    channel = "@" + channel_username
+
+    if channel not in CHANNELS:
+        return
+
     new_status = event.new_chat_member.status
 
-    if new_status in ("left", "kicked"):
-        try:
-            await bot.send_message(
-                event.from_user.id,
-                "⚠️ **Zorunlu kanallarımızdan ayrıldığını gördük.**\n\n"
-                "Botu kullanmaya devam etmek için tekrar katılmalısın.",
-                reply_markup=subscribe_keyboard(),
-                parse_mode="Markdown"
-            )
-        except Exception:
-            logging.exception("Üyelik uyarısı gönderilemedi")
+    if new_status not in ("left", "kicked"):
+        return
+
+    affected_user_id = event.new_chat_member.user.id
+
+    try:
+        await bot.send_message(
+            affected_user_id,
+            "⚠️ Zorunlu kanallarımızdan ayrıldığını gördük.\n\n"
+            "Botu kullanmak için tekrar katılmalısın.",
+            reply_markup=subscribe_keyboard()
+        )
+    except Exception:
+        logging.info(
+            "Üyelik bildirimi gönderilemedi: %s",
+            affected_user_id
+        )
 
 
 # ==============================
@@ -718,7 +750,9 @@ async def membership_changed(event: ChatMemberUpdated, bot: Bot):
 
 async def main():
     if not TOKEN:
-        raise RuntimeError("BOT_TOKEN Render ortam değişkeninde eksik!")
+        raise RuntimeError(
+            "BOT_TOKEN Render ortam değişkeninde eksik!"
+        )
 
     init_db()
 
@@ -726,7 +760,7 @@ async def main():
     dp = Dispatcher()
     dp.include_router(router)
 
-    logging.info("Swarovski VIP Bot v2 başlatılıyor...")
+    logging.info("Swarovski VIP Bot başlatılıyor...")
 
     try:
         await dp.start_polling(
@@ -740,4 +774,4 @@ async def main():
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
     asyncio.run(main())
-    
+            
