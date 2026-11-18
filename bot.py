@@ -1,466 +1,743 @@
+
 import asyncio
 import logging
+import os
+import sqlite3
+
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.filters import Command
-from aiogram.fsm.context import FSMContext
-from aiogram.fsm.state import State, StatesGroup
-from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
+    Message,
     CallbackQuery,
+    ChatMemberUpdated,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
-    Message,
 )
 
-# Bot API Tokenin
-TOKEN = "9181601804:AAHfoIJ21Ir-GCUWC_IQMYA3xWWwAMdbrME"
+# ==============================
+# AYARLAR
+# ==============================
 
-# Zorunlu Katılınması Gereken 3 Kanal
-CHANNELS = ["@swarovskiyeniden", "@swarovskihile", "@hilemfk"]
+TOKEN = os.getenv("9181601804:AAHfoIJ21Ir-GCUWC_IQMYA3xWWwAMdbrME", "")
+ADMIN_IDS = {
+    int(x.strip())
+    for x in os.getenv("ADMIN_IDS", "").split(",")
+    if x.strip().isdigit()
+}
 
-# Dosyaların bulunduğu kanal
+CHANNELS = [
+    "@swarovskiyeniden",
+    "@swarovskihile",
+    "@hilemfk",
+]
+
 FILE_CHANNEL = "@hilemfk"
-
-# Bellek Veritabanı
-active_users = set()  # Benzersiz kullanıcılar
-total_command_count = 0  # Toplam işlem/mesaj
-referrals = {}  # {user_id: davet_sayisi}
-referred_users = set()  # Zaten referansla kaydı düşülenler
+DB_NAME = "swarovski.db"
 
 router = Router()
 
 
-# Admin şifreleme state yönetimi
-class AdminState(StatesGroup):
-  waiting_for_password = State()
+# ==============================
+# VERİTABANI
+# ==============================
+
+def db():
+    return sqlite3.connect(DB_NAME)
 
 
-# Abonelik kontrolü (3 kanal için)
-async def check_user_subscriptions(bot: Bot, user_id: int) -> bool:
-  for channel in CHANNELS:
-    try:
-      member = await bot.get_chat_member(chat_id=channel, user_id=user_id)
-      if member.status in ["left", "kicked"]:
-        return False
-    except Exception:
-      return False
-  return True
+def init_db():
+    with db() as con:
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                user_id INTEGER PRIMARY KEY,
+                username TEXT,
+                referrer_id INTEGER,
+                referrals INTEGER DEFAULT 0,
+                referral_counted INTEGER DEFAULT 0
+            )
+        """)
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS stats (
+                name TEXT PRIMARY KEY,
+                value INTEGER DEFAULT 0
+            )
+        """)
+        con.execute("""
+            INSERT OR IGNORE INTO stats(name, value)
+            VALUES('commands', 0)
+        """)
 
 
-# Zorunlu kanal butonları (3 kanal)
-def get_subscribe_keyboard():
-  return InlineKeyboardMarkup(
-      inline_keyboard=[
-          [
-              InlineKeyboardButton(
-                  text="📢 1. Kanalımıza Katıl", url="https://t.me/swarovskiyeniden"
-              )
-          ],
-          [
-              InlineKeyboardButton(
-                  text="📢 2. Kanalımıza Katıl", url="https://t.me/swarovskihile"
-              )
-          ],
-          [
-              InlineKeyboardButton(
-                  text="📢 3. Kanalımıza Katıl (Depo)",
-                  url="https://t.me/hilemfk",
-              )
-          ],
-          [
-              InlineKeyboardButton(
-                  text="✅ Hepsine Katıldım, Kontrol Et 🔄",
-                  callback_data="check_sub",
-              )
-          ],
-      ]
-  )
+def register_user(user_id, username, referrer=None):
+    with db() as con:
+        con.execute("""
+            INSERT OR IGNORE INTO users
+            (user_id, username, referrer_id)
+            VALUES (?, ?, ?)
+        """, (user_id, username, referrer))
+
+        if referrer and referrer != user_id:
+            con.execute("""
+                UPDATE users
+                SET referrer_id = ?
+                WHERE user_id = ? AND referrer_id IS NULL
+            """, (referrer, user_id))
 
 
-# Ana Menü - VIP Arşiv ve Diğer Butonlar
-def get_main_menu_keyboard():
-  return InlineKeyboardMarkup(
-      inline_keyboard=[
-          [
-              InlineKeyboardButton(
-                  text="⚡ Standoff 2 Rootlu Sürüm 📥", callback_data="file_3"
-              )
-          ],
-          [
-              InlineKeyboardButton(
-                  text="📂 Ekstra Dosya 1", callback_data="file_5"
-              ),
-              InlineKeyboardButton(
-                  text="📂 Ekstra Dosya 2", callback_data="file_6"
-              ),
-          ],
-          [
-              InlineKeyboardButton(
-                  text="📂 Ekstra Dosya 3", callback_data="file_7"
-              ),
-              InlineKeyboardButton(
-                  text="📂 Ekstra Dosya 4", callback_data="file_8"
-              ),
-          ],
-          [
-              InlineKeyboardButton(
-                  text="🛠️ Root Uygulamaları", callback_data="root_apps"
-              )
-          ],
-          [
-              InlineKeyboardButton(
-                  text="🔥 Neptunium Hilesi", callback_data="other_cheat"
-              )
-          ],
-          [
-              InlineKeyboardButton(
-                  text="🎮 Eğlence Menüsü (Mini Oyunlar)",
-                  callback_data="fun_menu",
-              )
-          ],
-          [
-              InlineKeyboardButton(
-                  text="👥 Davet Et & Kazan (Referans)", callback_data="ref_menu"
-              )
-          ],
-          [
-              InlineKeyboardButton(
-                  text="🔐 Admin Paneli", callback_data="admin_panel"
-              )
-          ],
-      ]
-  )
+def add_command():
+    with db() as con:
+        con.execute("""
+            UPDATE stats SET value = value + 1
+            WHERE name = 'commands'
+        """)
 
 
-# Geri Dönüş Butonu
-def get_back_keyboard():
-  return InlineKeyboardMarkup(
-      inline_keyboard=[
-          [
-              InlineKeyboardButton(
-                  text="◀️ Ana Menüye Dön", callback_data="back_to_menu"
-              )
-          ]
-      ]
-  )
+def get_referrals(user_id):
+    with db() as con:
+        row = con.execute(
+            "SELECT referrals FROM users WHERE user_id = ?",
+            (user_id,)
+        ).fetchone()
+    return row[0] if row else 0
 
 
-# Eğlence Menüsü Butonları
-def get_fun_menu_keyboard():
-  return InlineKeyboardMarkup(
-      inline_keyboard=[
-          [
-              InlineKeyboardButton(
-                  text="🎲 Zar At", callback_data="fun_dice"
-              ),
-              InlineKeyboardButton(
-                  text="🎯 Şansını Dene", callback_data="fun_luck"
-              ),
-          ],
-          [
-              InlineKeyboardButton(
-                  text="🤖 Botun Sırrı Ne?", callback_data="fun_secret"
-              )
-          ],
-          [
-              InlineKeyboardButton(
-                  text="◀️ Ana Menüye Dön", callback_data="back_to_menu"
-              )
-          ],
-      ]
-  )
+def credit_referral(user_id):
+    with db() as con:
+        row = con.execute("""
+            SELECT referrer_id, referral_counted
+            FROM users WHERE user_id = ?
+        """, (user_id,)).fetchone()
+
+        if not row:
+            return
+
+        referrer_id, counted = row
+
+        if not referrer_id or counted:
+            return
+
+        con.execute("""
+            UPDATE users SET referral_counted = 1
+            WHERE user_id = ?
+        """, (user_id,))
+
+        con.execute("""
+            UPDATE users SET referrals = referrals + 1
+            WHERE user_id = ?
+        """, (referrer_id,))
 
 
-# /start komutu ve Referans Kontrolü
-@router.message(Command("start", "menu"))
-async def cmd_start(message: Message, bot: Bot, state: FSMContext):
-  global total_command_count
-  await state.clear()
+# ==============================
+# ÜYELİK KONTROLÜ
+# ==============================
 
-  user_id = message.from_user.id
-  active_users.add(user_id)
-  total_command_count += 1
+async def check_subscriptions(bot, user_id):
+    for channel in CHANNELS:
+        try:
+            member = await bot.get_chat_member(
+                chat_id=channel,
+                user_id=user_id
+            )
 
-  # Referans argümanını yakala
-  args = message.text.split()
-  pending_referrer = None
-  if len(args) > 1 and args[1].startswith("ref_"):
-    try:
-      referrer_id = int(args[1].split("_")[1])
-      if referrer_id != user_id:
-        pending_referrer = referrer_id
-    except Exception:
-      pass
+            if member.status in ("left", "kicked"):
+                return False
 
-  # Üyelik kontrolü
-  is_subscribed = await check_user_subscriptions(bot, user_id)
+            if member.status == "restricted":
+                if not member.is_member:
+                    return False
 
-  if not is_subscribed:
-    text = (
-        "⚠️ **DİKKAT! Botu Kullanabilmek İçin Şartlar Var** ⚠️\n\n"
-        "Botumuzdaki tüm hile dosyalarına ve özelliklere ulaşabilmek için "
-        "aşağıdaki **3 kanalımıza da** eksiksiz abone olman gerekiyor! 🚀\n\n"
+        except Exception as error:
+            logging.warning(
+                "Üyelik kontrolü başarısız (%s): %s",
+                channel, error
+            )
+            return False
+
+    return True
+
+
+def subscribe_keyboard():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(
+            text="📢 1. Kanal",
+            url="https://t.me/swarovskiyeniden"
+        )],
+        [InlineKeyboardButton(
+            text="📢 2. Kanal",
+            url="https://t.me/swarovskihile"
+        )],
+        [InlineKeyboardButton(
+            text="📢 3. Kanal",
+            url="https://t.me/hilemfk"
+        )],
+        [InlineKeyboardButton(
+            text="✅ Katıldım, Kontrol Et",
+            callback_data="check_sub"
+        )],
+    ])
+
+
+# ==============================
+# MENÜLER
+# ==============================
+
+def main_menu():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(
+            text="⚡ Standoff 2 Rootlu Sürüm",
+            callback_data="file_3"
+        )],
+        [
+            InlineKeyboardButton(
+                text="📂 Ekstra Dosya 1",
+                callback_data="file_5"
+            ),
+            InlineKeyboardButton(
+                text="📂 Ekstra Dosya 2",
+                callback_data="file_6"
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                text="📂 Ekstra Dosya 3",
+                callback_data="file_7"
+            ),
+            InlineKeyboardButton(
+                text="📂 Ekstra Dosya 4",
+                callback_data="file_8"
+            ),
+        ],
+        [InlineKeyboardButton(
+            text="🛠️ Root Uygulamaları",
+            callback_data="root_apps"
+        )],
+        [InlineKeyboardButton(
+            text="🔥 Neptunium",
+            callback_data="file_116"
+        )],
+        [InlineKeyboardButton(
+            text="⭐ Brawl Stars",
+            callback_data="file_117"
+        )],
+        [InlineKeyboardButton(
+            text="💎 Exodium",
+            callback_data="file_118"
+        )],
+        [InlineKeyboardButton(
+            text="🎯 LEGIT Oyun Taktikleri",
+            callback_data="legit"
+        )],
+        [InlineKeyboardButton(
+            text="🎮 Eğlence Menüsü",
+            callback_data="fun_menu"
+        )],
+        [InlineKeyboardButton(
+            text="👥 Davet Et & Kazan",
+            callback_data="ref_menu"
+        )],
+        [InlineKeyboardButton(
+            text="🔐 Admin Paneli",
+            callback_data="admin_panel"
+        )],
+    ])
+
+
+def back_keyboard():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(
+            text="◀️ Ana Menü",
+            callback_data="back_to_menu"
+        )]
+    ])
+
+
+def referral_gate_keyboard(link):
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(
+            text="👥 Arkadaşını Davet Et",
+            url=link
+        )],
+        [InlineKeyboardButton(
+            text="🔄 Davetimi Kontrol Et",
+            callback_data="refresh_ref"
+        )],
+        [InlineKeyboardButton(
+            text="📢 Kanalları Kontrol Et",
+            callback_data="check_sub"
+        )],
+    ])
+
+
+# ==============================
+# ERİŞİM KONTROLÜ
+# ==============================
+
+async def show_subscription(message):
+    await message.answer(
+        "⚠️ **KANALLARA KATILMAN GEREKİYOR!**\n\n"
+        "Botu kullanabilmek için üç kanalımıza da katılmalısın.",
+        reply_markup=subscribe_keyboard(),
+        parse_mode="Markdown"
     )
-    if pending_referrer:
-      text += (
-          f"💡 *Not:* Bir arkadaşının davet linkiyle geldin! Kanallara katıldıktan"
-          f" sonra referansı geçerli sayılacak."
-      )
 
-    # State içine bekleyen referansı kaydedebiliriz veya kontrol butonunda işleyebiliriz
-    await state.update_data(pending_referrer=pending_referrer)
+
+async def show_referral_gate(message, bot, user_id):
+    info = await bot.get_me()
+    link = f"https://t.me/{info.username}?start=ref_{user_id}"
 
     await message.answer(
-        text, reply_markup=get_subscribe_keyboard(), parse_mode="Markdown"
+        "👥 **DAVET ŞARTI**\n\n"
+        "Kanallarımıza katıldın! Şimdi botun diğer özelliklerini "
+        "açmak için 1 gerçek arkadaşını davet etmelisin.\n\n"
+        f"Başarılı davetlerin: {get_referrals(user_id)}/1\n\n"
+        "Arkadaşın davet bağlantından gelip üç kanalımıza katılmalı.",
+        reply_markup=referral_gate_keyboard(link),
+        parse_mode="Markdown"
     )
-    return
-
-  # Eğer zaten kanallardaysa ve referansla geldiyse hemen işle
-  if pending_referrer and user_id not in referred_users:
-    referred_users.add(user_id)
-    referrals[pending_referrer] = referrals.get(pending_referrer, 0) + 1
-    try:
-      await bot.send_message(
-          pending_referrer,
-          "🎉 **Harika!** Davet ettiğin bir arkadaşın kanallara katıldı ve"
-          " botu başlattı. Referansın başarıyla işlendi! 🚀",
-      )
-    except Exception:
-      pass
-
-  await message.answer(
-      "🔥 **SWAROVSKI VIP ARŞİV PANELİNE HOŞ GELDİN** 🔥\n\n"
-      "👑 *İstediğin dosyayı veya hileyi aşağıdaki kategorilerden seçebilirsin:* 👇",
-      reply_markup=get_main_menu_keyboard(),
-      parse_mode="Markdown",
-  )
 
 
-# Üyelik Kontrol Butonu
+async def has_access(bot, user_id):
+    if not await check_subscriptions(bot, user_id):
+        return False
+
+    return get_referrals(user_id) >= 1
+
+
+async def require_access(callback, bot):
+    user_id = callback.from_user.id
+
+    if not await check_subscriptions(bot, user_id):
+        await callback.answer(
+            "❌ Kanallardan ayrılmışsın! Tekrar katıl.",
+            show_alert=True
+        )
+        await callback.message.answer(
+            "⚠️ **Üyeliğin eksik!**",
+            reply_markup=subscribe_keyboard(),
+            parse_mode="Markdown"
+        )
+        return False
+
+    if get_referrals(user_id) < 1:
+        await callback.answer(
+            "❌ Önce 1 arkadaşını davet etmelisin.",
+            show_alert=True
+        )
+        await show_referral_gate(
+            callback.message, bot, user_id
+        )
+        return False
+
+    return True
+
+
+# ==============================
+# START
+# ==============================
+
+@router.message(Command("start", "menu"))
+async def start(message: Message, bot: Bot):
+    user = message.from_user
+    args = message.text.split()
+
+    referrer = None
+
+    if len(args) > 1 and args[1].startswith("ref_"):
+        try:
+            referrer = int(args[1][4:])
+        except ValueError:
+            pass
+
+    register_user(user.id, user.username, referrer)
+    add_command()
+
+    if not await check_subscriptions(bot, user.id):
+        await show_subscription(message)
+        return
+
+    credit_referral(user.id)
+
+    if get_referrals(user.id) < 1:
+        await show_referral_gate(message, bot, user.id)
+        return
+
+    await message.answer(
+        "🔥 **SWAROVSKI VIP ARŞİVİNE HOŞ GELDİN!**\n\n"
+        "İstediğin kategoriyi aşağıdan seçebilirsin.",
+        reply_markup=main_menu(),
+        parse_mode="Markdown"
+    )
+
+
+# ==============================
+# ÜYELİK KONTROL BUTONU
+# ==============================
+
 @router.callback_query(F.data == "check_sub")
-async def verify_subscription(
-    callback: CallbackQuery, bot: Bot, state: FSMContext
-):
-  user_id = callback.from_user.id
-  active_users.add(user_id)
+async def check_sub_button(callback: CallbackQuery, bot: Bot):
+    user_id = callback.from_user.id
 
-  is_subscribed = await check_user_subscriptions(bot, user_id)
+    if not await check_subscriptions(bot, user_id):
+        await callback.answer(
+            "❌ Üç kanalın tamamına katılmalısın!",
+            show_alert=True
+        )
+        return
 
-  if not is_subscribed:
-    await callback.answer(
-        "❌ Hey! Hala 3 kanalın hepsine katılmamışsın gözden kaçmış olmasın?",
-        show_alert=True,
+    credit_referral(user_id)
+
+    await callback.answer("✅ Kanal üyeliğin onaylandı!")
+
+    if get_referrals(user_id) < 1:
+        await show_referral_gate(
+            callback.message, bot, user_id
+        )
+    else:
+        await callback.message.answer(
+            "🎉 **Tüm şartlar tamamlandı!**",
+            reply_markup=main_menu(),
+            parse_mode="Markdown"
+        )
+
+
+@router.callback_query(F.data == "refresh_ref")
+async def refresh_ref(callback: CallbackQuery, bot: Bot):
+    user_id = callback.from_user.id
+
+    if not await check_subscriptions(bot, user_id):
+        await callback.answer(
+            "Önce üç kanala katılmalısın.",
+            show_alert=True
+        )
+        return
+
+    credit_referral(user_id)
+
+    if get_referrals(user_id) >= 1:
+        await callback.answer(
+            "🎉 Davet şartın tamamlandı!",
+            show_alert=True
+        )
+        await callback.message.answer(
+            "🔥 **VIP MENÜ AÇILDI!**",
+            reply_markup=main_menu(),
+            parse_mode="Markdown"
+        )
+    else:
+        await callback.answer(
+            "Henüz başarılı bir davetin yok.",
+            show_alert=True
+        )
+
+
+# ==============================
+# REFERANS MENÜSÜ
+# ==============================
+
+@router.callback_query(F.data == "ref_menu")
+async def ref_menu(callback: CallbackQuery, bot: Bot):
+    user_id = callback.from_user.id
+
+    if not await check_subscriptions(bot, user_id):
+        await callback.answer(
+            "Önce kanallara katılmalısın.",
+            show_alert=True
+        )
+        return
+
+    info = await bot.get_me()
+    link = f"https://t.me/{info.username}?start=ref_{user_id}"
+
+    await callback.message.answer(
+        "👥 **DAVET ET & KAZAN**\n\n"
+        f"🔗 Davet bağlantın:\n`{link}`\n\n"
+        f"🎯 Başarılı davet: {get_referrals(user_id)}\n\n"
+        "Arkadaşın bağlantından gelip üç kanalımıza katılınca "
+        "davetin sayılır.",
+        reply_markup=back_keyboard(),
+        parse_mode="Markdown"
     )
-    return
 
-  # Kullanıcı katıldıysa, state'deki bekleyen referansı kontrol et
-  data = await state.get_data()
-  pending_referrer = data.get("pending_referrer")
-  if pending_referrer and user_id not in referred_users:
-    referred_users.add(user_id)
-    referrals[pending_referrer] = referrals.get(pending_referrer, 0) + 1
+    await callback.answer()
+
+
+# ==============================
+# DOSYA GÖNDERME
+# ==============================
+
+FILES = {
+    "file_3": 3,
+    "file_5": 5,
+    "file_6": 6,
+    "file_7": 7,
+    "file_8": 8,
+    "file_116": 116,
+    "file_117": 117,
+    "file_118": 118,
+}
+
+
+@router.callback_query(F.data.in_(list(FILES.keys())))
+async def send_file(callback: CallbackQuery, bot: Bot):
+    if not await require_access(callback, bot):
+        return
+
+    message_id = FILES[callback.data]
+
+    await callback.answer("📦 Dosya hazırlanıyor...")
+
     try:
-      await bot.send_message(
-          pending_referrer,
-          "🎉 **Harika!** Davet ettiğin bir arkadaşın kanallara katıldı ve"
-          " botu onayladı. Referansın başarıyla işlendi! 🚀",
-      )
+        await bot.copy_message(
+            chat_id=callback.message.chat.id,
+            from_chat_id=FILE_CHANNEL,
+            message_id=message_id
+        )
     except Exception:
-      pass
-
-  await state.clear()
-  await callback.answer("🎉 Tüm üyeliklerin onaylandı!")
-  await callback.message.edit_text(
-      "👑 **Tebrikler, Erişim Onaylandı!** 👑\n\n"
-      "🚀 *VIP Arşivi aşağıdan seçebilirsin:* 👇",
-      reply_markup=get_main_menu_keyboard(),
-      parse_mode="Markdown",
-  )
+        logging.exception("Dosya gönderilemedi")
+        await callback.message.answer(
+            "❌ Dosya gönderilemedi. Depo kanalındaki mesajı kontrol et."
+        )
 
 
-# Eğlence Menüsü Handler
+# ==============================
+# LEGIT TAKTİKLER
+# ==============================
+
+@router.callback_query(F.data == "legit")
+async def legit_menu(callback: CallbackQuery, bot: Bot):
+    if not await require_access(callback, bot):
+        return
+
+    text = (
+        "🎯 **STANDOFF 2 LEGIT TAKTİKLER**\n\n"
+        "1️⃣ **Nişan:** Nişangâhını rakibin çıkabileceği kafa "
+        "hizasında tut.\n\n"
+        "2️⃣ **Hareket:** Gereksiz yere açık alanda koşma. "
+        "Siperleri kullan.\n\n"
+        "3️⃣ **Ses:** Rakibin ayak seslerini dinle ve acele karar verme.\n\n"
+        "4️⃣ **Recoil:** Silahların geri tepmesini antrenman "
+        "alanında öğren.\n\n"
+        "5️⃣ **Harita:** Köşeleri ve geçiş noktalarını ezberle.\n\n"
+        "6️⃣ **Takım:** Takım arkadaşlarınla aynı anda hareket et.\n\n"
+        "7️⃣ **Ekonomi:** Oyun içi paranı takımın durumuna göre kullan.\n\n"
+        "8️⃣ **Güvenlik:** Bilinmeyen APK ve hile dosyalarına "
+        "hesap bilgilerini verme.\n\n"
+        "🏆 En iyi gelişim düzenli ve adil antrenmandır."
+    )
+
+    await callback.message.answer(
+        text,
+        reply_markup=back_keyboard(),
+        parse_mode="Markdown"
+    )
+    await callback.answer()
+
+
+# ==============================
+# ROOT UYGULAMALARI
+# ==============================
+
+@router.callback_query(F.data == "root_apps")
+async def root_apps(callback: CallbackQuery, bot: Bot):
+    if not await require_access(callback, bot):
+        return
+
+    await callback.answer(
+        "🛠️ Root uygulamaları yakında eklenecek!",
+        show_alert=True
+    )
+
+
+# ==============================
+# EĞLENCE
+# ==============================
+
+def fun_keyboard():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(
+                text="🎲 Zar At",
+                callback_data="fun_dice"
+            ),
+            InlineKeyboardButton(
+                text="🍀 Şans",
+                callback_data="fun_luck"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                text="🤖 Botun Sırrı",
+                callback_data="fun_secret"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                text="◀️ Ana Menü",
+                callback_data="back_to_menu"
+            )
+        ]
+    ])
+
+
 @router.callback_query(F.data == "fun_menu")
-async def fun_menu_handler(callback: CallbackQuery):
-  await callback.message.edit_text(
-      "🎮 **EĞLENCE & MİNİ OYUNLAR MENÜSÜ** 🎮\n\n"
-      "*Hilelerden sıkıldın mı? Biraz kafanı dağıtmak için aşağıdaki seçenekleri"
-      " kullanabilirsin:* 👇",
-      reply_markup=get_fun_menu_keyboard(),
-      parse_mode="Markdown",
-  )
+async def fun_menu(callback: CallbackQuery, bot: Bot):
+    if not await require_access(callback, bot):
+        return
+
+    await callback.message.answer(
+        "🎮 **EĞLENCE MENÜSÜ**",
+        reply_markup=fun_keyboard(),
+        parse_mode="Markdown"
+    )
+    await callback.answer()
 
 
 @router.callback_query(F.data == "fun_dice")
 async def fun_dice(callback: CallbackQuery, bot: Bot):
-  await callback.answer("🎲 Zar atılıyor...")
-  await bot.send_dice(chat_id=callback.message.chat.id)
+    if not await require_access(callback, bot):
+        return
+
+    await callback.answer("🎲 Zar atılıyor...")
+    await bot.send_dice(callback.message.chat.id)
 
 
 @router.callback_query(F.data == "fun_luck")
-async def fun_luck(callback: CallbackQuery):
-  await callback.answer(
-      "🍀 Şanslı Gününtesin! Bugün Standoff 2 maçlarında rank"
-      " atlayacaksın!",
-      show_alert=True,
-  )
+async def fun_luck(callback: CallbackQuery, bot: Bot):
+    if not await require_access(callback, bot):
+        return
+
+    await callback.answer(
+        "🍀 Bugün şans seninle olsun!",
+        show_alert=True
+    )
 
 
 @router.callback_query(F.data == "fun_secret")
-async def fun_secret(callback: CallbackQuery):
-  await callback.answer(
-      "🤖 Bu bot tamamen Swarovski güvencesiyle efsane kodlandı!",
-      show_alert=True,
-  )
+async def fun_secret(callback: CallbackQuery, bot: Bot):
+    if not await require_access(callback, bot):
+        return
 
-
-# Referans Menüsü
-@router.callback_query(F.data == "ref_menu")
-async def ref_menu_handler(callback: CallbackQuery, bot: Bot):
-  user_id = callback.from_user.id
-  bot_info = await bot.get_me()
-  bot_username = bot_info.username
-
-  user_ref_count = referrals.get(user_id, 0)
-  ref_link = f"https://t.me/{bot_username}?start=ref_{user_id}"
-
-  text = (
-      f"👥 **DAVET ET & KAZAN (REFERANS SİSTEMİ)** 👥\n\n"
-      f"🔗 *Senin Kişisel Davet Linkin:*\n`{ref_link}`\n\n"
-      f"📊 **Toplam Davet Ettiğin Kişi:** `{user_ref_count}` kişi\n\n"
-      "💡 *Nasıl Çalışır?*\n"
-      "Bu linki arkadaşlarına at. Arkadaşın linke basıp botu başlatarak 3"
-      " kanalımıza da katıldığında referansın anında geçerli sayılır!"
-  )
-  await callback.message.edit_text(
-      text, reply_markup=get_back_keyboard(), parse_mode="Markdown"
-  )
-
-
-# Ana Menüye Dönüş
-@router.callback_query(F.data == "back_to_menu")
-async def back_to_menu(callback: CallbackQuery, state: FSMContext):
-  await state.clear()
-  await callback.message.edit_text(
-      "🔥 **SWAROVSKI VIP ARŞİV PANELİ** 🔥\n\n"
-      "👑 *İstediğin dosyayı veya hileyi aşağıdaki kategorilerden seçebilirsin:* 👇",
-      reply_markup=get_main_menu_keyboard(),
-      parse_mode="Markdown",
-  )
-
-
-# Admin Paneline Tıklandığında Şifre İste
-@router.callback_query(F.data == "admin_panel")
-async def admin_panel_click(callback: CallbackQuery, state: FSMContext):
-  await callback.answer()
-  await state.set_state(AdminState.waiting_for_password)
-  await callback.message.edit_text(
-      "🔐 **YÖNETİCİ GİRİŞİ** 🔐\n\n"
-      "Lütfen admin paneline erişmek için **şifreyi** yazıp gönder:",
-      reply_markup=get_back_keyboard(),
-      parse_mode="Markdown",
-  )
-
-
-# Şifre Kontrolü
-@router.message(AdminState.waiting_for_password)
-async def check_admin_password(message: Message, state: FSMContext):
-  entered_password = message.text.strip()
-
-  if entered_password == "efe01":
-    await state.clear()
-    user_count = len(active_users)
-
-    stats_text = (
-        f"👑 **SWAROVSKI ADMIN PANELİ** 👑\n\n"
-        f"📊 **Bot İstatistikleri:**\n"
-        f"👥 Toplam Kullanıcı Sayısı: `{user_count}` kişi\n"
-        f"💬 Toplam Etkileşim / Komut: `{total_command_count}` kez\n"
-        f"🔗 Toplam Başarılı Referans: `{len(referred_users)}` kişi\n\n"
-        f"🟢 *Sistem Durumu: Sorunsuz Çalışıyor (Stabil)*"
-    )
-    await message.answer(
-        stats_text,
-        reply_markup=InlineKeyboardMarkup(
-            inline_keyboard=[
-                [
-                    InlineKeyboardButton(
-                        text="◀️ Ana Menüye Dön", callback_data="back_to_menu"
-                    )
-                ]
-            ]
-        ),
-        parse_mode="Markdown",
-    )
-  else:
-    await message.answer(
-        "❌ **Yanlış Şifre!**\n\nTekrar deneyebilir veya vazgeçebilirsin.",
-        reply_markup=get_back_keyboard(),
-        parse_mode="Markdown",
-    )
-
-
-# Genel Dosya Gönderme Fonksiyonu
-async def send_file_from_channel(callback: CallbackQuery, bot: Bot, msg_id: int):
-  global total_command_count
-  total_command_count += 1
-  active_users.add(callback.from_user.id)
-
-  if not await check_user_subscriptions(bot, callback.from_user.id):
     await callback.answer(
-        "⚠️ İşlem iptal! Önce 3 kanalımızın hepsine katılman gerekiyor.",
-        show_alert=True,
+        "🤖 Swarovski ekibi tarafından geliştirildi!",
+        show_alert=True
     )
-    return
 
-  await callback.answer("📦 Dosya kanaldan çekiliyor, beklemede kal...")
 
-  try:
-    await bot.copy_message(
-        chat_id=callback.message.chat.id,
-        from_chat_id=FILE_CHANNEL,
-        message_id=msg_id,
-    )
-  except Exception as e:
+# ==============================
+# GERİ DÖNÜŞ
+# ==============================
+
+@router.callback_query(F.data == "back_to_menu")
+async def back_to_menu(callback: CallbackQuery, bot: Bot):
+    if not await has_access(bot, callback.from_user.id):
+        if not await check_subscriptions(bot, callback.from_user.id):
+            await callback.answer("Kanal üyeliğin eksik.", show_alert=True)
+            await callback.message.answer(
+                "⚠️ Kanallara tekrar katılmalısın.",
+                reply_markup=subscribe_keyboard()
+            )
+        else:
+            await callback.answer("Bir arkadaşını davet etmelisin.", show_alert=True)
+            await show_referral_gate(
+                callback.message, bot, callback.from_user.id
+            )
+        return
+
+    await callback.answer()
     await callback.message.answer(
-        "⚠️ Dosya gönderilirken bir hata oluştu! "
-        "Yöneticinin kanaldaki mesaj ID'sini doğru ayarladığından emin ol.",
-        parse_mode="Markdown",
+        "🔥 **SWAROVSKI VIP ARŞİVİ**",
+        reply_markup=main_menu(),
+        parse_mode="Markdown"
     )
 
 
-# Butonların Dosya Eşleştirmeleri (Ekstra Dosyalar ve Rootlu)
-@router.callback_query(F.data.in_(["file_3", "file_5", "file_6", "file_7", "file_8"]))
-async def send_indexed_files(callback: CallbackQuery, bot: Bot):
-  msg_id = int(callback.data.split("_")[1])
-  await send_file_from_channel(callback, bot, msg_id)
+# ==============================
+# ADMIN PANELİ
+# ==============================
+
+@router.callback_query(F.data == "admin_panel")
+async def admin_panel(callback: CallbackQuery):
+    if callback.from_user.id not in ADMIN_IDS:
+        await callback.answer(
+            "⛔ Bu alan yalnızca yöneticilere açık.",
+            show_alert=True
+        )
+        return
+
+    with db() as con:
+        users = con.execute(
+            "SELECT COUNT(*) FROM users"
+        ).fetchone()[0]
+
+        commands = con.execute(
+            "SELECT value FROM stats WHERE name='commands'"
+        ).fetchone()[0]
+
+        referrals_total = con.execute(
+            "SELECT SUM(referrals) FROM users"
+        ).fetchone()[0] or 0
+
+    await callback.message.answer(
+        "👑 **SWAROVSKI ADMIN PANELİ**\n\n"
+        f"👥 Toplam kullanıcı: `{users}`\n"
+        f"💬 Toplam komut: `{commands}`\n"
+        f"🔗 Başarılı davet: `{referrals_total}`\n"
+        "🟢 Sistem: Çalışıyor",
+        reply_markup=back_keyboard(),
+        parse_mode="Markdown"
+    )
+
+    await callback.answer()
 
 
-# Root uygulamaları için
-@router.callback_query(F.data == "root_apps")
-async def root_apps_handler(callback: CallbackQuery, bot: Bot):
-  await callback.answer(
-      "🛠️ Root uygulamaları yakında eklenecek!", show_alert=True
-  )
+# ==============================
+# ÜYELİK DEĞİŞİKLİĞİ BİLDİRİMİ
+# ==============================
+
+@router.chat_member()
+async def membership_changed(event: ChatMemberUpdated, bot: Bot):
+    old_status = event.old_chat_member.status
+    new_status = event.new_chat_member.status
+
+    if new_status in ("left", "kicked"):
+        try:
+            await bot.send_message(
+                event.from_user.id,
+                "⚠️ **Zorunlu kanallarımızdan ayrıldığını gördük.**\n\n"
+                "Botu kullanmaya devam etmek için tekrar katılmalısın.",
+                reply_markup=subscribe_keyboard(),
+                parse_mode="Markdown"
+            )
+        except Exception:
+            logging.exception("Üyelik uyarısı gönderilemedi")
 
 
-# Neptunium Hilesi (Diğer Özel Hile Butonu)
-@router.callback_query(F.data == "other_cheat")
-async def other_cheat_handler(callback: CallbackQuery, bot: Bot):
-  # Eğer Neptunium hilesini de kanala attıysan ve ID'sini biliyorsan doğrudan send_file_from_channel(callback, bot, MESAJ_ID) yapabilirsin.
-  # Şimdilik örnek olarak mesaj ID'si üzerinden kanaldan çektiriyoruz (Kanalda Neptunium'un olduğu mesaj ID'sini buraya yazabilirsin, örneğin 9):
-  await send_file_from_channel(callback, bot, 9)
-
+# ==============================
+# BAŞLAT
+# ==============================
 
 async def main():
-  bot = Bot(token=TOKEN)
-  dp = Dispatcher(storage=MemoryStorage())
-  dp.include_router(router)
+    if not TOKEN:
+        raise RuntimeError("BOT_TOKEN Render ortam değişkeninde eksik!")
 
-  print("Tüm özellikler aktif, stabil bot çalışıyor...")
-  await dp.start_polling(bot)
+    init_db()
+
+    bot = Bot(token=TOKEN)
+    dp = Dispatcher()
+    dp.include_router(router)
+
+    logging.info("Swarovski VIP Bot v2 başlatılıyor...")
+
+    try:
+        await dp.start_polling(
+            bot,
+            allowed_updates=dp.resolve_used_update_types()
+        )
+    finally:
+        await bot.session.close()
 
 
 if __name__ == "__main__":
-  logging.basicConfig(level=logging.INFO)
-  asyncio.run(main())
-      
+    logging.basicConfig(level=logging.INFO)
+    asyncio.run(main())
+    
